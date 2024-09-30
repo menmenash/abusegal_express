@@ -11,13 +11,18 @@ import google.api_core.exceptions
 import asyncio
 from io import BytesIO
 import logging
+import traceback
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # Initialize the Storage Client
 storage_client = storage.Client()
-bucket_name = 'abu_segal_images' 
+bucket_name = 'abu_segal_images'  # Replace with your actual bucket name
 bucket = storage_client.bucket(bucket_name)
+
+# Firestore batch size limit
+FIRESTORE_BATCH_LIMIT = 500
 
 async def fetch_and_store_posts(channel_username, db, client):
     try:
@@ -40,17 +45,18 @@ async def fetch_and_store_posts(channel_username, db, client):
     posts_ref = db.collection('posts')
 
     # Query to get existing posts from the last 24 hours for this channel
-    query = posts_ref.where(
-        filter=firestore.FieldFilter('channel_id', '==', channel_username)
-    ).where(
-        filter=firestore.FieldFilter('date', '>', yesterday)
-    )
+    # Updated to use keyword arguments for filters to avoid warnings
+    query = posts_ref.where('channel_id', '==', channel_username).where('date', '>', yesterday)
     existing_posts = query.stream()
 
     # Collect existing message IDs
     existing_post_ids = set()
     for doc in existing_posts:
         existing_post_ids.add(doc.to_dict().get('id'))
+
+    # Lists to hold posts to store and document references to delete
+    posts_to_store = []
+    posts_to_delete = []
 
     # Fetch messages from the last 24 hours
     async for message in client.iter_messages(channel):
@@ -107,7 +113,7 @@ async def fetch_and_store_posts(channel_username, db, client):
                     blob = bucket.blob(blob_name)
 
                     # Upload the image from the buffer
-                    blob.upload_from_file(buffer, content_type='image/jpeg')
+                    await asyncio.to_thread(blob.upload_from_file, buffer, content_type='image/jpeg')
                     logger.info(f"Uploaded photo to Cloud Storage: {blob_name}")
 
                     # Get the public URL
@@ -141,7 +147,7 @@ async def fetch_and_store_posts(channel_username, db, client):
                         blob = bucket.blob(blob_name)
 
                         # Upload the image from the buffer
-                        blob.upload_from_file(buffer, content_type=media_msg.document.mime_type)
+                        await asyncio.to_thread(blob.upload_from_file, buffer, content_type=media_msg.document.mime_type)
                         logger.info(f"Uploaded image document to Cloud Storage: {blob_name}")
 
                         # Get the public URL
@@ -164,68 +170,97 @@ async def fetch_and_store_posts(channel_username, db, client):
             'images': image_urls
         }
 
-        # Log the post data
-        logger.info(f"Storing post: {post}")
+        # Add the post to the list to store
+        posts_to_store.append(post)
+        logger.info(f"Prepared post for storage: {post}")
 
-        # Store the new post in the database with retry logic
-        post_ref = db.collection('posts').document(f"{channel_username}_{message_id}")
-        await store_post_with_retry(db, post_ref, post)
+    # Prepare batch writes for storing posts
+    if posts_to_store:
+        await batch_write_posts(db, posts_to_store)
 
-    # Delete old posts from Firestore
-    await delete_old_posts(channel_username, db)
+    # Prepare batch deletions for old posts
+    await batch_delete_old_posts(channel_username, db)
 
     # Delete old media files from Cloud Storage
-    delete_old_media(channel_username, bucket)
+    await batch_delete_old_media(channel_username, bucket)
 
     # Ensure the client remains connected until all operations are complete
-    if client.is_connected():
-        await client.disconnect()
-        logger.info("Client disconnected.")
+    # Removed client disconnect to maintain singleton
 
-async def store_post_with_retry(db, post_ref, post_data, retries=5, delay=0.5):
-    for attempt in range(retries):
-        try:
-            post_ref.set(post_data)
-            return  # Success
-        except google.api_core.exceptions.Aborted as e:
-            logger.warning(f"Write conflict encountered, retrying... (attempt {attempt+1}/{retries})")
-            await asyncio.sleep(delay)
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            raise e  # Re-raise the exception for non-retryable errors
-    raise google.api_core.exceptions.Aborted("Failed to write post after multiple retries.")
+async def batch_write_posts(db, posts_to_store):
+    """
+    Writes multiple posts to Firestore in batches to reduce the number of write operations.
+    """
+    try:
+        # Split the posts into batches of FIRESTORE_BATCH_LIMIT
+        for i in range(0, len(posts_to_store), FIRESTORE_BATCH_LIMIT):
+            batch = db.batch()
+            batch_posts = posts_to_store[i:i + FIRESTORE_BATCH_LIMIT]
+            for post in batch_posts:
+                post_ref = db.collection('posts').document(f"{post['channel_id']}_{post['id']}")
+                batch.set(post_ref, post)
+            # Run the batch write in a separate thread to avoid blocking
+            await asyncio.to_thread(batch.commit)
+            logger.info(f"Committed a batch of {len(batch_posts)} posts to Firestore.")
+    except Exception as e:
+        logger.error(f"Error during batch write to Firestore: {e}", exc_info=True)
+        raise e
 
-async def delete_old_posts(channel_username, db):
-    # Calculate time 24 hours ago
-    yesterday = datetime.now(israel_tz) - timedelta(days=1)
+async def batch_delete_old_posts(channel_username, db):
+    """
+    Deletes old posts from Firestore in batches.
+    """
+    try:
+        # Calculate time 24 hours ago
+        yesterday = datetime.now(israel_tz) - timedelta(days=1)
 
-    # Reference to the 'posts' collection
-    posts_ref = db.collection('posts')
+        # Reference to the 'posts' collection
+        posts_ref = db.collection('posts')
 
-    # Query to get posts older than 24 hours for this channel
-    old_posts_query = posts_ref.where(
-        filter=firestore.FieldFilter('channel_id', '==', channel_username)
-    ).where(
-        filter=firestore.FieldFilter('date', '<', yesterday)
-    )
+        # Query to get posts older than 24 hours for this channel
+        old_posts_query = posts_ref.where('channel_id', '==', channel_username).where('date', '<', yesterday)
+        old_posts = old_posts_query.stream()
 
-    # Delete old posts
-    old_posts = old_posts_query.stream()
-    for doc in old_posts:
-        logger.info(f"Deleting old post: {doc.id}")
-        doc.reference.delete()
+        # Collect document references to delete
+        docs_to_delete = [doc.reference for doc in old_posts]
 
-def delete_old_media(channel_username, bucket):
-    # Calculate time 24 hours ago
-    yesterday = datetime.now(israel_tz) - timedelta(days=1)
+        if docs_to_delete:
+            # Split into batches of FIRESTORE_BATCH_LIMIT
+            for i in range(0, len(docs_to_delete), FIRESTORE_BATCH_LIMIT):
+                batch = db.batch()
+                batch_deletes = docs_to_delete[i:i + FIRESTORE_BATCH_LIMIT]
+                for doc_ref in batch_deletes:
+                    batch.delete(doc_ref)
+                # Run the batch delete in a separate thread to avoid blocking
+                await asyncio.to_thread(batch.commit)
+                logger.info(f"Deleted a batch of {len(batch_deletes)} old posts from Firestore.")
+    except Exception as e:
+        logger.error(f"Error during batch deletion of old posts: {e}", exc_info=True)
+        raise e
 
-    # List blobs in the channel's folder
-    blobs = bucket.list_blobs(prefix=f"{channel_username}/")
 
-    for blob in blobs:
-        # Get the blob's time_created in the timezone
-        blob_time = blob.time_created.astimezone(israel_tz)
+async def batch_delete_old_media(channel_username, bucket):
+    """
+    Deletes old media files from Cloud Storage in batches.
+    """
+    try:
+        # Calculate time 24 hours ago
+        yesterday = datetime.now(israel_tz) - timedelta(days=1)
 
-        if blob_time < yesterday:
-            logger.info(f"Deleting old media file: {blob.name}")
-            blob.delete()
+        # List blobs in the channel's folder
+        blobs = list(bucket.list_blobs(prefix=f"{channel_username}/"))
+
+        # Collect blobs to delete
+        blobs_to_delete = [blob for blob in blobs if blob.time_created.astimezone(israel_tz) < yesterday]
+
+        if blobs_to_delete:
+            # Cloud Storage's batch API allows multiple deletions
+            # Use `delete()` in batches to optimize
+            for i in range(0, len(blobs_to_delete), FIRESTORE_BATCH_LIMIT):
+                batch_blobs = blobs_to_delete[i:i + FIRESTORE_BATCH_LIMIT]
+                await asyncio.to_thread(lambda: [blob.delete() for blob in batch_blobs])
+                logger.info(f"Deleted a batch of {len(batch_blobs)} media files from Cloud Storage.")
+    except Exception as e:
+        logger.error(f"Error during batch deletion of old media: {e}", exc_info=True)
+        raise e
+
