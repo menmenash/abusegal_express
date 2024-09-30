@@ -3,3 +3,7 @@ google-cloud-firestore
 requests
 beautifulsoup4
 pytz
+telethon
+google-cloud-secret-manager
+google-cloud-storage
+

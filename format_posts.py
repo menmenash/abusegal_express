@@ -46,13 +46,31 @@ def format_as_html(posts):
 
             .channel-0 { 
                 font-weight: bold; 
-                color: darkred;  /* Dark red for the first channel */
+                color: #8B0000;  /* Dark Red for the first channel */
                 margin-bottom: 5px; 
             }
 
             .channel-1 { 
                 font-weight: bold; 
-                color: #4a76a8;  /* Blue for the second channel */
+                color: #00008B;  /* Dark Blue for the second channel */
+                margin-bottom: 5px; 
+            }
+
+            .channel-2 { 
+                font-weight: bold; 
+                color: #006400;  /* Dark Green for the third channel */
+                margin-bottom: 5px; 
+            }
+
+            .channel-3 { 
+                font-weight: bold; 
+                color: #FF8C00;  /* Orange for the fourth channel */
+                margin-bottom: 5px; 
+            }
+
+            .channel-4 { 
+                font-weight: bold; 
+                color: black;  /* Black for the fifth channel */
                 margin-bottom: 5px; 
             }
 
@@ -94,7 +112,6 @@ def format_as_html(posts):
     <body>
         <div class="container">
     '''
-
     sorted_posts = sorted(posts, key=lambda x: x['date'])
     cleaned_posts = []
     skip_next = False
@@ -111,7 +128,11 @@ def format_as_html(posts):
         israel_time = post['date'].astimezone(israel_tz)
         date_str = israel_time.strftime('%d.%m.%y %H:%M')
         channel_username = post['channel_id'].replace('@', '')
-        channel_index = CHANNEL_USERNAMES.index(channel_username) % 2
+        try:
+            channel_index = CHANNEL_USERNAMES.index(channel_username) % 5  # Now modulo 5
+        except ValueError:
+            # If the channel is not in the list, assign a default color
+            channel_index = 0  # Or any other default index
         rtl_class = 'rtl' if any('\u0590' <= char <= '\u05FF' for char in post['text']) else ''
         clean_text = post['text'].replace("כדי להגיב לכתבה לחצו כאן", "")
         clean_text = re.sub(r'(#{2,})', r'<br>\1<br>', clean_text)
@@ -137,7 +158,7 @@ def format_as_html(posts):
                 html += f'<br><a href="{file_url}" target="_blank">Download File</a>'
 
         html += '</div>'
-    
+
     html += '''
         </div>
     </body>
